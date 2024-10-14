@@ -23,7 +23,7 @@ class BetaTransformer(nn.Module):
         self.fc_mu = nn.Linear(d_model, 1)  # Compute mu from final output
         self.fc_log_sigma_diag = nn.Linear(d_model, 1)  # Compute log_sigma_diag from final output
 
-    def forward(self, input_batch, return_weights=False):
+    def def forward(self, input_batch, return_weights=False, return_prior_beta=False):
         batch_size, seq_len, input_dim = input_batch.size()
         assert input_dim == 2, "Input must have two features: Apple and SP500 returns."
 
@@ -68,10 +68,14 @@ class BetaTransformer(nn.Module):
         # Posterior mean of beta
         beta = b / S  # Shape: (batch_size, 1)
 
-        if return_weights:
-            return W, beta  # Return both W and beta
+        if return_weights and return_prior_beta:
+            return W, beta, mu
+        elif return_weights:
+            return W, beta
+        elif return_prior_beta:
+            return beta, mu
         else:
-            return beta  # Return only beta
+            return beta
 
 model = BetaTransformer(input_dim=2, lookback=256)
 batch_size = 32
@@ -81,129 +85,6 @@ beta = model(input_batch)
 print(beta.shape)  # Should output: torch.Size([32, 1])
 
 
-def train_model_on_returns(model, data, optimizer, epochs, batch_size, lookback, num_sequences):
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-        train_loader = prepare_dataloader(
-            data, num_sequences=num_sequences, batch_size=batch_size,
-            lookback=lookback, shuffle=True
-        )
-        
-        for batch_idx, batch in enumerate(train_loader):
-            batch = batch[0]
-            input_batch = batch[:, :lookback, :]  # Shape: (batch_size, lookback, 2)
-            apple_return_next_day = batch[:, lookback, 0]   # Shape: (batch_size,)
-            sp500_return_next_day = batch[:, lookback, 1]   # Shape: (batch_size,)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            beta = model(input_batch)  # Shape: (batch_size, 1)
-            
-            # Predict Apple return for the next day
-            predicted_apple_return = beta.squeeze() * sp500_return_next_day  # Shape: (batch_size,)
-            
-            # Compute loss
-            mse_loss = torch.nn.MSELoss()
-            loss = mse_loss(predicted_apple_return, apple_return_next_day)
-            
-            # Backward pass and optimization
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-        
-        avg_train_loss = train_loss / len(train_loader)
-        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}")
-
-def validate_model(model, val_data, lookback, batch_size=1, return_weights=False):
-    model.eval()
-    num_sequences = len(val_data) - lookback - 1
-    val_loader = prepare_dataloader(
-        val_data,
-        num_sequences=num_sequences,
-        batch_size=batch_size,
-        lookback=lookback,
-        shuffle=False  # Chronological order
-    )
-    total_loss = 0.0
-    mse_loss = torch.nn.MSELoss()
-    all_beta_values = []
-    all_weights = [] if return_weights else None
-    
-    with torch.no_grad():
-        for batch_idx, (input_batch,) in enumerate(val_loader):
-            apple_return_next_day = input_batch[:, lookback, 0]   # Shape: (batch_size,)
-            sp500_return_next_day = input_batch[:, lookback, 1]   # Shape: (batch_size,)
-            
-            # Forward pass
-            if return_weights:
-                W, beta = model(input_batch[:, :lookback, :], return_weights=True)
-                all_weights.append(W.cpu().numpy())
-            else:
-                beta = model(input_batch[:, :lookback, :])
-            
-            # Predict Apple return
-            predicted_apple_return = beta.squeeze() * sp500_return_next_day
-            
-            # Compute loss
-            loss = mse_loss(predicted_apple_return, apple_return_next_day)
-            total_loss += loss.item()
-            
-            all_beta_values.append(beta.cpu().numpy())
-        
-    avg_loss = total_loss / len(val_loader)
-    print(f"Validation/Test Loss: {avg_loss:.6f}")
-    
-    # Concatenate all beta values
-    all_beta_values = np.concatenate(all_beta_values, axis=0)
-    
-    if return_weights:
-        # Concatenate all W values
-        all_weights = np.concatenate(all_weights, axis=0)  # Shape: (num_sequences, lookback)
-        return avg_loss, all_beta_values, all_weights
-    else:
-        return avg_loss, all_beta_values
-
-if __name__ == "__main__":
-    # Parameters
-    lookback = 256
-    batch_size_train = 32
-    epochs = 10
-    num_sequences_train = len(train_data) - lookback - 1
-    
-    # Instantiate the model
-    input_dim = 2
-    model = BetaTransformer(input_dim=input_dim, lookback=lookback)
-    
-    # Define the optimizer
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    
-    # Train the model
-    train_model_on_returns(
-        model,
-        train_data,
-        optimizer,
-        epochs=epochs,
-        lookback=lookback,
-        batch_size=batch_size_train,
-        num_sequences=num_sequences_train
-    )
-    
-    # Validate the model
-    validate_model(
-        model,
-        val_data,
-        lookback=lookback,
-        batch_size=1,  # You can adjust this
-        return_weights=True
-    )
-
-
-import torch
-import torch.optim as optim
-import numpy as np
 
 import torch
 import torch.optim as optim
@@ -252,7 +133,7 @@ def train_model_on_returns(model, data, optimizer, epochs, batch_size, lookback,
         avg_train_loss = train_loss / len(train_loader)
         print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}")
 
-def validate_model(model, val_data, lookback, batch_size=1, return_weights=False):
+def validate_model(model, val_data, lookback, batch_size=1, return_weights=False, return_prior_beta=False):
     model.eval()
     num_sequences = len(val_data) - lookback - 1
     val_loader = prepare_dataloader(
@@ -265,17 +146,25 @@ def validate_model(model, val_data, lookback, batch_size=1, return_weights=False
     total_loss = 0.0
     mse_loss = torch.nn.MSELoss()
     all_beta_values = []
+    all_prior_beta_values = [] if return_prior_beta else None
     all_weights = [] if return_weights else None
-    
+
     with torch.no_grad():
         for batch_idx, (input_batch,) in enumerate(val_loader):
             apple_return_next_day = input_batch[:, lookback, 0]   # Shape: (batch_size,)
             sp500_return_next_day = input_batch[:, lookback, 1]   # Shape: (batch_size,)
             
             # Forward pass
-            if return_weights:
+            if return_weights and return_prior_beta:
+                W, beta, mu = model(input_batch[:, :lookback, :], return_weights=True, return_prior_beta=True)
+                all_weights.append(W.cpu().numpy())
+                all_prior_beta_values.append(mu.cpu().numpy())
+            elif return_weights:
                 W, beta = model(input_batch[:, :lookback, :], return_weights=True)
                 all_weights.append(W.cpu().numpy())
+            elif return_prior_beta:
+                beta, mu = model(input_batch[:, :lookback, :], return_prior_beta=True)
+                all_prior_beta_values.append(mu.cpu().numpy())
             else:
                 beta = model(input_batch[:, :lookback, :])
             
@@ -294,12 +183,19 @@ def validate_model(model, val_data, lookback, batch_size=1, return_weights=False
     # Concatenate all beta values
     all_beta_values = np.concatenate(all_beta_values, axis=0)  # Shape: (num_sequences, 1)
     
+    # Concatenate prior beta values if collected
+    if return_prior_beta:
+        all_prior_beta_values = np.concatenate(all_prior_beta_values, axis=0)  # Shape: (num_sequences, 1)
+    
+    # Handle return values
+    return_values = [avg_loss, all_beta_values]
+    if return_prior_beta:
+        return_values.append(all_prior_beta_values)
     if return_weights:
-        # Concatenate all W values
         all_weights = np.concatenate(all_weights, axis=0)  # Shape: (num_sequences, lookback)
-        return avg_loss, all_beta_values, all_weights
-    else:
-        return avg_loss, all_beta_values
+        return_values.append(all_weights)
+    
+    return tuple(return_values)
 
 if __name__ == "__main__":
     # Parameters
@@ -326,30 +222,46 @@ if __name__ == "__main__":
         num_sequences=num_sequences_train
     )
     
-    # Validate the model and get beta values and weights
-    avg_loss, all_beta_values, all_weights = validate_model(
+    # Validate the model and get beta values, prior beta, and weights
+    results = validate_model(
         model,
         val_data,
         lookback=lookback,
         batch_size=1,  # You can adjust this
-        return_weights=True
+        return_weights=True,
+        return_prior_beta=True
     )
     
-    # Plot the estimated beta values
+    # Unpack the results
+    if len(results) == 4:
+        avg_loss, all_beta_values, all_prior_beta_values, all_weights = results
+    elif len(results) == 3:
+        avg_loss, all_beta_values, all_prior_beta_values = results
+        all_weights = None
+    else:
+        avg_loss, all_beta_values = results
+        all_prior_beta_values = None
+        all_weights = None
+    
+    # Plot the beta values
     plt.figure(figsize=(12, 6))
-    plt.plot(all_beta_values, label='Estimated Beta')
-    plt.title('Estimated Beta Values Over Time')
+    plt.plot(all_beta_values, label='Posterior Beta')
+    if all_prior_beta_values is not None:
+        plt.plot(all_prior_beta_values, label='Prior Beta', linestyle='--')
+    plt.title('Beta Values Over Time')
     plt.xlabel('Time')
     plt.ylabel('Beta Value')
     plt.legend()
     plt.grid(True)
     plt.show()
     
-    # Plot the weights as a heatmap
-    plt.figure(figsize=(12, 6))
-    plt.imshow(all_weights.T, aspect='auto', cmap='viridis', origin='lower')
-    plt.colorbar(label='Weight Value')
-    plt.title('Weights Heatmap Over Time')
-    plt.xlabel('Sequence Index')
-    plt.ylabel('Lookback Time Step')
-    plt.show()
+    # Plot the weights as a heatmap if collected
+    if all_weights is not None:
+        plt.figure(figsize=(12, 6))
+        plt.imshow(all_weights.T, aspect='auto', cmap='viridis', origin='lower')
+        plt.colorbar(label='Weight Value')
+        plt.title('Weights Heatmap Over Time')
+        plt.xlabel('Sequence Index')
+        plt.ylabel('Lookback Time Step')
+        plt.show()
+
