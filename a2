@@ -1,0 +1,95 @@
+class BetaTransformer(nn.Module):
+    def __init__(
+        self, input_dim, d_model=64, nhead=4, num_encoder_layers=2,
+        dim_feedforward=128, lookback=256, dropout=0.1
+    ):
+        super(BetaTransformer, self).__init__()
+        
+        # Transformer setup
+        self.input_projection = nn.Linear(input_dim, d_model)
+        self.positional_encoding = PositionalEncoding(d_model)
+        
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer, num_layers=num_encoder_layers
+        )
+        
+        # Output layer for weights
+        self.fc_out = nn.Linear(d_model, lookback)
+    
+    def forward(self, input_batch, return_weights=False):
+        batch_size, seq_len, input_dim = input_batch.size()
+        assert input_dim == 2, "Input must have two features: Apple and SP500 returns."
+
+        # Extract returns
+        apple_returns = input_batch[:, :, 0]  # Shape: (batch_size, lookback)
+        sp500_returns = input_batch[:, :, 1]  # Shape: (batch_size, lookback)
+
+        # Compute OLS estimates for mu and sigma^2
+        # Add a small value to denominator for numerical stability
+        epsilon = 1e-8
+
+        # Reshape for matrix operations
+        X = sp500_returns  # Shape: (batch_size, lookback)
+        y = apple_returns  # Shape: (batch_size, lookback)
+        X_mean = X.mean(dim=1, keepdim=True)
+        y_mean = y.mean(dim=1, keepdim=True)
+        
+        # Center X and y
+        X_centered = X - X_mean
+        y_centered = y - y_mean
+
+        # Compute beta_hat (mu) using OLS
+        numerator = (X_centered * y_centered).sum(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        denominator = (X_centered ** 2).sum(dim=1, keepdim=True) + epsilon  # Shape: (batch_size, 1)
+        mu = numerator / denominator  # Shape: (batch_size, 1)
+
+        # Compute residuals
+        y_hat = mu * X_centered
+        residuals = y_centered - y_hat.squeeze(-1)  # Shape: (batch_size, lookback)
+
+        # Compute sigma^2
+        residual_sum_of_squares = (residuals ** 2).sum(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        sigma_squared = residual_sum_of_squares / (seq_len - 1 + epsilon)  # Shape: (batch_size, 1)
+        sigma_inv = 1.0 / (sigma_squared + epsilon)  # Shape: (batch_size, 1)
+
+        # Transformer Encoding
+        x = self.input_projection(input_batch)  # Shape: (batch_size, lookback, d_model)
+        x = self.positional_encoding(x)
+        transformer_output = self.transformer_encoder(x)
+
+        final_output = transformer_output[:, -1, :]  # Shape: (batch_size, d_model)
+
+        # Compute dynamic weights W
+        transformer_weights = self.fc_out(final_output)  # Shape: (batch_size, lookback)
+        W = F.softplus(transformer_weights)  # Ensure weights are positive
+
+        # Prepare data for matrix operations
+        X = sp500_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        y = apple_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        W_expanded = W.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+
+        # Weighted observations
+        WX = W_expanded * X  # Shape: (batch_size, lookback, 1)
+        Wy = W_expanded * y
+
+        # Compute sufficient statistics
+        X_T_WX = torch.bmm(X.transpose(1, 2), WX).squeeze(-1)  # Shape: (batch_size, 1)
+        X_T_Wy = torch.bmm(X.transpose(1, 2), Wy).squeeze(-1)  # Shape: (batch_size, 1)
+
+        # Compute posterior parameters
+        S = sigma_inv + X_T_WX  # Shape: (batch_size, 1)
+        Sigma_inv_mu = sigma_inv * mu  # Shape: (batch_size, 1)
+        b = Sigma_inv_mu + X_T_Wy  # Shape: (batch_size, 1)
+
+        # Posterior mean of beta
+        beta = b / S  # Shape: (batch_size, 1)
+
+        if return_weights:
+            return W, beta  # Return both W and beta
+        else:
+            return beta  # Return only beta
