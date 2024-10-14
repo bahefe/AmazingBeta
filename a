@@ -1,0 +1,81 @@
+class BetaTransformer(nn.Module):
+    def __init__(
+        self, input_dim, d_model=64, nhead=4, num_encoder_layers=2,
+        dim_feedforward=128, lookback=256, dropout=0.1
+    ):
+        super(BetaTransformer, self).__init__()
+        
+        # Transformer setup
+        self.input_projection = nn.Linear(input_dim, d_model)  # Project input features to d_model
+        self.positional_encoding = PositionalEncoding(d_model)  # Positional encoding
+
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer, num_layers=num_encoder_layers
+        )
+
+        # Output layers for weights, mu, and log_sigma_diag
+        self.fc_out = nn.Linear(d_model, lookback)  # Output weights for each time step
+        self.fc_mu = nn.Linear(d_model, 1)  # Compute mu from final output
+        self.fc_log_sigma_diag = nn.Linear(d_model, 1)  # Compute log_sigma_diag from final output
+
+    def forward(self, input_batch, return_weights=False):
+        batch_size, seq_len, input_dim = input_batch.size()
+        assert input_dim == 2, "Input must have two features: Apple and SP500 returns."
+
+        apple_returns = input_batch[:, :, 0]  # Shape: (batch_size, lookback)
+        sp500_returns = input_batch[:, :, 1]  # Shape: (batch_size, lookback)
+
+        # Transformer Encoding
+        x = self.input_projection(input_batch)  # Shape: (batch_size, lookback, d_model)
+        x = self.positional_encoding(x)  # Add positional encoding
+        transformer_output = self.transformer_encoder(x)  # Shape: (batch_size, lookback, d_model)
+
+        final_output = transformer_output[:, -1, :]  # Shape: (batch_size, d_model)
+
+        # Compute dynamic weights W
+        transformer_weights = self.fc_out(final_output)  # Shape: (batch_size, lookback)
+        W = F.softplus(transformer_weights)  # Ensure weights are positive
+
+        # Compute mu and sigma_diag dynamically
+        mu = self.fc_mu(final_output)  # Shape: (batch_size, 1)
+        log_sigma_diag = self.fc_log_sigma_diag(final_output)  # Shape: (batch_size, 1)
+        sigma_diag = torch.exp(log_sigma_diag)  # Ensure positivity
+        sigma_inv = 1.0 / sigma_diag  # Shape: (batch_size, 1)
+
+        # Prepare data for matrix operations
+        X = sp500_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        y = apple_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        W_expanded = W.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+
+        # Weighted observations
+        WX = W_expanded * X  # Element-wise multiplication
+        Wy = W_expanded * y
+
+        # Compute sufficient statistics
+        X_T_WX = torch.bmm(X.transpose(1, 2), WX).squeeze(-1)  # Shape: (batch_size, 1)
+        X_T_Wy = torch.bmm(X.transpose(1, 2), Wy).squeeze(-1)  # Shape: (batch_size, 1)
+
+        # Compute posterior parameters
+        S = sigma_inv + X_T_WX  # Shape: (batch_size, 1)
+        Sigma_inv_mu = sigma_inv * mu  # Shape: (batch_size, 1)
+        b = Sigma_inv_mu + X_T_Wy  # Shape: (batch_size, 1)
+
+        # Posterior mean of beta
+        beta = b / S  # Shape: (batch_size, 1)
+
+        if return_weights:
+            return W, beta  # Return both W and beta
+        else:
+            return beta  # Return only beta
+
+model = BetaTransformer(input_dim=2, lookback=256)
+batch_size = 32
+lookback = 256
+input_batch = torch.randn(batch_size, lookback, 2)  # Random data for testing
+beta = model(input_batch)
+print(beta.shape)  # Should output: torch.Size([32, 1])
