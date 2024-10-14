@@ -1,0 +1,267 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class BetaTransformer(nn.Module):
+    def __init__(
+        self, input_dim, d_model=64, nhead=4, num_encoder_layers=2,
+        dim_feedforward=128, lookback=256, dropout=0.1
+    ):
+        super(BetaTransformer, self).__init__()
+        
+        # Transformer setup
+        self.input_projection = nn.Linear(input_dim, d_model)
+        self.positional_encoding = PositionalEncoding(d_model)
+        
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer, num_layers=num_encoder_layers
+        )
+        
+        # Output layer for weights
+        self.fc_out = nn.Linear(d_model, lookback)
+        
+        # Neural networks to compute mu and log_sigma_squared
+        self.fc_mu = nn.Sequential(
+            nn.Linear(input_dim * lookback, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1)
+        )
+        self.fc_log_sigma_squared = nn.Sequential(
+            nn.Linear(input_dim * lookback, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1)
+        )
+        
+    def forward(self, input_batch, return_weights=False):
+        batch_size, seq_len, input_dim = input_batch.size()
+        assert input_dim == 2, "Input must have two features: Apple and SP500 returns."
+        
+        # Extract returns
+        apple_returns = input_batch[:, :, 0]  # Shape: (batch_size, lookback)
+        sp500_returns = input_batch[:, :, 1]  # Shape: (batch_size, lookback)
+        
+        # Flatten input for mu and sigma_squared networks
+        input_flat = input_batch.view(batch_size, -1)  # Shape: (batch_size, input_dim * lookback)
+        
+        # Compute mu and sigma_squared using neural networks
+        mu = self.fc_mu(input_flat)  # Shape: (batch_size, 1)
+        log_sigma_squared = self.fc_log_sigma_squared(input_flat)  # Shape: (batch_size, 1)
+        sigma_squared = torch.exp(log_sigma_squared)  # Ensure positivity
+        sigma_inv = 1.0 / (sigma_squared + 1e-8)  # Shape: (batch_size, 1)
+        
+        # Transformer Encoding
+        x = self.input_projection(input_batch)  # Shape: (batch_size, lookback, d_model)
+        x = self.positional_encoding(x)
+        transformer_output = self.transformer_encoder(x)
+        
+        final_output = transformer_output[:, -1, :]  # Shape: (batch_size, d_model)
+        
+        # Compute dynamic weights W
+        transformer_weights = self.fc_out(final_output)  # Shape: (batch_size, lookback)
+        W = F.softplus(transformer_weights)  # Ensure weights are positive
+        
+        # Prepare data for matrix operations
+        X = sp500_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        y = apple_returns.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        W_expanded = W.unsqueeze(-1)  # Shape: (batch_size, lookback, 1)
+        
+        # Weighted observations
+        WX = W_expanded * X  # Shape: (batch_size, lookback, 1)
+        Wy = W_expanded * y
+        
+        # Compute sufficient statistics
+        X_T_WX = torch.bmm(X.transpose(1, 2), WX).squeeze(-1)  # Shape: (batch_size, 1)
+        X_T_Wy = torch.bmm(X.transpose(1, 2), Wy).squeeze(-1)  # Shape: (batch_size, 1)
+        
+        # Compute posterior parameters
+        S = sigma_inv + X_T_WX  # Shape: (batch_size, 1)
+        Sigma_inv_mu = sigma_inv * mu  # Shape: (batch_size, 1)
+        b = Sigma_inv_mu + X_T_Wy  # Shape: (batch_size, 1)
+        
+        # Posterior mean of beta
+        beta = b / S  # Shape: (batch_size, 1)
+        
+        # For regularization, compute OLS estimates
+        mu_ols, sigma_squared_ols = self.compute_ols_estimates(apple_returns, sp500_returns)
+        
+        if return_weights:
+            return beta, mu, sigma_squared, mu_ols, sigma_squared_ols, W
+        else:
+            return beta, mu, sigma_squared, mu_ols, sigma_squared_ols
+    
+    def compute_ols_estimates(self, y, X):
+        # y and X are of shape (batch_size, lookback)
+        epsilon = 1e-8
+        
+        # Compute means
+        X_mean = X.mean(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        y_mean = y.mean(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        
+        # Center data
+        X_centered = X - X_mean  # Shape: (batch_size, lookback)
+        y_centered = y - y_mean  # Shape: (batch_size, lookback)
+        
+        # Compute numerator and denominator
+        numerator = (X_centered * y_centered).sum(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        denominator = (X_centered ** 2).sum(dim=1, keepdim=True) + epsilon  # Shape: (batch_size, 1)
+        mu_ols = numerator / denominator  # Shape: (batch_size, 1)
+        
+        # Compute residuals
+        y_hat = mu_ols * X_centered  # Shape: (batch_size, lookback)
+        residuals = y_centered - y_hat.squeeze(-1)  # Shape: (batch_size, lookback)
+        
+        # Compute sigma^2_ols
+        residual_sum_of_squares = (residuals ** 2).sum(dim=1, keepdim=True)  # Shape: (batch_size, 1)
+        sigma_squared_ols = residual_sum_of_squares / (X_centered.size(1) - 1 + epsilon)  # Shape: (batch_size, 1)
+        
+        return mu_ols.detach(), sigma_squared_ols.detach()  # Detach to prevent gradients flowing through OLS estimates
+def train_model_on_returns(model, data, optimizer, epochs, batch_size, lookback, num_sequences, lambda_mu=1.0, lambda_sigma=1.0):
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_loader = prepare_dataloader(data, num_sequences=num_sequences, batch_size=batch_size, lookback=lookback, shuffle=True)
+        
+        for batch_idx, batch in enumerate(train_loader):
+            batch = batch[0]
+            
+            input_batch = batch[:, :lookback, :]  # All features (Apple and S&P 500)
+            features_next_day = batch[:, lookback, :]  # Next day's features (Apple and S&P 500)
+            apple_return_next_day = batch[:, lookback, 0]   # Next day's Apple return
+            sp500_return_next_day = batch[:, lookback, 1]   # Next day's S&P 500 return
+            
+            optimizer.zero_grad()
+            
+            # Forward pass
+            beta, mu, sigma_squared, mu_ols, sigma_squared_ols = model(input_batch)
+            
+            # Predict Apple return for the next day using only S&P 500 return
+            predicted_apple_return = beta.squeeze() * sp500_return_next_day  # Shape: (batch_size,)
+            
+            # Compute prediction loss
+            mse_loss = torch.nn.MSELoss()
+            prediction_loss = mse_loss(predicted_apple_return, apple_return_next_day)
+            
+            # Compute regularization terms
+            mu_reg = lambda_mu * mse_loss(mu.squeeze(), mu_ols.squeeze())
+            sigma_reg = lambda_sigma * mse_loss(sigma_squared.squeeze(), sigma_squared_ols.squeeze())
+            
+            # Total loss
+            loss = prediction_loss + mu_reg + sigma_reg
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.6f}")
+def validate_model(model, val_data, lookback, batch_size=1, return_weights=False, save_path=None, lambda_mu=1.0, lambda_sigma=1.0):
+    model.eval()
+    num_sequences = len(val_data) - lookback - 1
+    val_loader = prepare_dataloader(
+        val_data,
+        num_sequences=num_sequences,
+        batch_size=batch_size,
+        lookback=lookback,
+        shuffle=False
+    )
+    total_loss = 0.0
+    mse_loss = torch.nn.MSELoss()
+    all_beta_values = []
+    all_weights = [] if return_weights else None
+    
+    with torch.no_grad():
+        for batch_idx, (input_batch,) in enumerate(val_loader):
+            features_next_day = input_batch[:, lookback, :]
+            apple_return_next_day = input_batch[:, lookback, 0]
+            sp500_return_next_day = input_batch[:, lookback, 1]
+            
+            # Forward pass
+            if return_weights:
+                beta, mu, sigma_squared, mu_ols, sigma_squared_ols, W = model(input_batch[:, :lookback, :], return_weights=True)
+            else:
+                beta, mu, sigma_squared, mu_ols, sigma_squared_ols = model(input_batch[:, :lookback, :])
+            
+            # Predict Apple return
+            predicted_apple_return = beta.squeeze() * sp500_return_next_day
+            
+            # Compute prediction loss
+            prediction_loss = mse_loss(predicted_apple_return, apple_return_next_day)
+            
+            # Compute regularization terms (optional)
+            mu_reg = lambda_mu * mse_loss(mu.squeeze(), mu_ols.squeeze())
+            sigma_reg = lambda_sigma * mse_loss(sigma_squared.squeeze(), sigma_squared_ols.squeeze())
+            
+            # Total loss
+            loss = prediction_loss + mu_reg + sigma_reg
+            total_loss += loss.item()
+            
+            all_beta_values.append(beta.cpu().numpy())
+            
+            if return_weights:
+                all_weights.append(W.cpu().numpy())
+    
+    avg_loss = total_loss / len(val_loader)
+    print(f"Validation/Test Loss: {avg_loss:.6f}")
+    
+    # Concatenate all beta values
+    all_beta_values = np.concatenate(all_beta_values, axis=0)
+    
+    if return_weights:
+        # Concatenate all W values
+        all_weights = np.concatenate(all_weights, axis=0)  # Shape: (num_sequences, lookback)
+        if save_path:
+            os.makedirs(save_path, exist_ok=True)
+            np.save(os.path.join(save_path, 'W_test.npy'), all_weights)
+            np.save(os.path.join(save_path, 'beta_test.npy'), all_beta_values)
+            print(f"W and beta have been saved to {save_path}")
+        return avg_loss, all_beta_values, all_weights
+    else:
+        return avg_loss, all_beta_values
+def instantiate_model(input_dim, d_model=64, nhead=4, num_encoder_layers=2, dim_feedforward=128, lookback=256, dropout=0.1):
+    model = BetaTransformer(
+        input_dim=input_dim,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        dim_feedforward=dim_feedforward,
+        lookback=lookback,
+        dropout=dropout
+    )
+    return model
+if __name__ == "__main__":
+    # Parameters
+    lookback = 256
+    batch_size_train = 32
+    epochs = 10
+    num_sequences_train = len(train_data) - lookback - 1
+    
+    # Set input_dim to 2
+    input_dim = 2  
+    model = instantiate_model(input_dim=input_dim, lookback=lookback)
+    
+    # Define the optimizer
+    optimizer = get_optimizer(model, learning_rate=1e-3)
+    
+    # Train the model
+    train_model_on_returns(
+        model,
+        train_data,
+        optimizer,
+        epochs=epochs,
+        lookback=lookback,
+        batch_size=batch_size_train,
+        num_sequences=num_sequences_train,
+        lambda_mu=1.0,       # Regularization strength for mu
+        lambda_sigma=1.0     # Regularization strength for sigma_squared
+    )
+print(f"Epoch {epoch+1}, Total Loss: {avg_train_loss:.6f}, Prediction Loss: {avg_prediction_loss:.6f}, Mu Reg: {avg_mu_reg:.6f}, Sigma Reg: {avg_sigma_reg:.6f}")
+torch.save(model.state_dict(), 'beta_transformer_model.pth')
+model = instantiate_model(input_dim=input_dim, lookback=lookback)
+model.load_state_dict(torch.load('beta_transformer_model.pth'))
+model.eval()
