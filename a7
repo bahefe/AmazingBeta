@@ -1,0 +1,206 @@
+# Import necessary libraries
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import torch
+import torch.nn as nn
+import math
+from torch.nn.functional import softplus
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from itertools import product
+
+# Set random seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Data Preparation
+# (Same as before)
+# ...
+
+# Dataset Class
+# (Same as before)
+# ...
+
+# Sinusoidal Positional Encoding
+# (Same as before)
+# ...
+
+# Transformer Model with trainable mu and sigma_inv
+# (Same as before)
+# ...
+
+# Beta Estimation Function
+# (Same as before)
+# ...
+
+# RMSE Loss Function
+# (Same as before)
+# ...
+
+# Learning Rate Scheduler with Warm-Up and Decay
+# (Same as before)
+# ...
+
+# Hyperparameter grids
+lookback_list = [64, 128, 256]
+dropout_list = [0.0, 0.25, 0.5]
+d_model_list = [64, 128]
+dim_feedforward_list = [64, 128, 256]
+
+# Other hyperparameters
+learning_rate = 0.001
+num_epochs = 10
+nhead = 4
+num_layers = 2
+batch_size = 64
+
+best_val_loss = float('inf')
+best_hyperparams = None
+best_model_state = None
+
+for lookback, dropout, d_model, dim_feedforward in product(lookback_list, dropout_list, d_model_list, dim_feedforward_list):
+    print(f"\nTraining with lookback={lookback}, dropout={dropout}, d_model={d_model}, dim_feedforward={dim_feedforward}")
+
+    val_data_adjusted = pd.concat([train_data.tail(lookback), val_data], ignore_index=True).reset_index(drop=True)
+
+    train_dataset = BetaDataset(train_data, lookback)
+    val_dataset = BetaDataset(val_data_adjusted, lookback)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    model = TransformerWeightGenerator(
+        lookback=lookback,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout
+    )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    total_steps = num_epochs * len(train_loader)
+    warmup_steps = int(0.1 * total_steps)
+    scheduler = WarmupCosineAnnealingLR(optimizer, warmup_steps, total_steps)
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_losses = []
+        for batch in train_loader:
+            optimizer.zero_grad()
+
+            sp500_seq = batch['sp500_seq']
+            stock_seq = batch['stock_seq']
+            sp500_next = batch['sp500_next']
+            stock_next = batch['stock_next']
+
+            weights = model(sp500_seq)
+            beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+            stock_pred = beta * sp500_next
+
+            loss = RMSELoss(stock_pred, stock_next)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            train_losses.append(loss.item())
+
+        avg_train_loss = np.mean(train_losses)
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                sp500_seq = batch['sp500_seq']
+                stock_seq = batch['stock_seq']
+                sp500_next = batch['sp500_next']
+                stock_next = batch['stock_next']
+
+                weights = model(sp500_seq)
+                beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+                stock_pred = beta * sp500_next
+
+                loss = RMSELoss(stock_pred, stock_next)
+                val_losses.append(loss.item())
+
+        avg_val_loss = np.mean(val_losses)
+        print(f"Epoch {epoch+1}/{num_epochs}, Training RMSE Loss: {avg_train_loss:.6f}, Validation RMSE Loss: {avg_val_loss:.6f}")
+
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        best_hyperparams = {
+            'lookback': lookback,
+            'dropout': dropout,
+            'd_model': d_model,
+            'dim_feedforward': dim_feedforward
+        }
+        best_model_state = model.state_dict()
+        print(f"New best model found with Validation RMSE Loss: {best_val_loss:.6f}")
+
+print("\nBest Hyperparameters:")
+print(best_hyperparams)
+print(f"Validation RMSE Loss: {best_val_loss:.6f}")
+
+# Retrain the best model on combined training and validation data
+combined_data = pd.concat([train_data, val_data], ignore_index=True)
+lookback = best_hyperparams['lookback']
+test_data_adjusted = pd.concat([combined_data.tail(lookback), test_data], ignore_index=True).reset_index(drop=True)
+
+combined_dataset = BetaDataset(combined_data, lookback)
+test_dataset = BetaDataset(test_data_adjusted, lookback)
+
+combined_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+model = TransformerWeightGenerator(
+    lookback=best_hyperparams['lookback'],
+    d_model=best_hyperparams['d_model'],
+    nhead=nhead,
+    num_layers=num_layers,
+    dim_feedforward=best_hyperparams['dim_feedforward'],
+    dropout=best_hyperparams['dropout']
+)
+
+# Optionally load the best model state
+model.load_state_dict(best_model_state)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+total_steps = num_epochs * len(combined_loader)
+warmup_steps = int(0.1 * total_steps)
+scheduler = WarmupCosineAnnealingLR(optimizer, warmup_steps, total_steps)
+
+for epoch in range(num_epochs):
+    model.train()
+    train_losses = []
+    for batch in combined_loader:
+        optimizer.zero_grad()
+
+        sp500_seq = batch['sp500_seq']
+        stock_seq = batch['stock_seq']
+        sp500_next = batch['sp500_next']
+        stock_next = batch['stock_next']
+
+        weights = model(sp500_seq)
+        beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+        stock_pred = beta * sp500_next
+
+        loss = RMSELoss(stock_pred, stock_next)
+
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        train_losses.append(loss.item())
+
+    avg_train_loss = np.mean(train_losses)
+    print(f"Retrain Epoch {epoch+1}/{num_epochs}, Training RMSE Loss: {avg_train_loss:.6f}")
+
+# Evaluate on test set
+# (Same as before)
+# ...
+
+# Visualization and other outputs
+# (Same as before)
+# ...
