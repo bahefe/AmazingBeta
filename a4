@@ -1,0 +1,33 @@
+import torch
+
+# Assume X has shape [32, 256, 1], Y has shape [32, 256, 1], and weights have shape [32, 256]
+def weighted_linear_regression(X, Y, weights):
+    # Weights need to be expanded for matrix operations (add singleton dimension for broadcasting)
+    W = torch.diag_embed(weights)  # [32, 256, 256]
+
+    # Compute X^T W X for each batch
+    X_t = X.transpose(1, 2)  # Transpose to get X^T, shape [32, 1, 256]
+    X_t_W = torch.matmul(X_t, W)  # Shape [32, 1, 256] @ [32, 256, 256] = [32, 1, 256]
+    X_t_W_X = torch.matmul(X_t_W, X)  # Shape [32, 1, 256] @ [32, 256, 1] = [32, 1, 1]
+
+    # Compute the inverse of X^T W X for each batch (scalar inverse)
+    X_t_W_X_inv = torch.inverse(X_t_W_X)  # Shape [32, 1, 1]
+
+    # Compute X^T W Y for each batch
+    X_t_W_Y = torch.matmul(X_t_W, Y)  # Shape [32, 1, 256] @ [32, 256, 1] = [32, 1, 1]
+
+    # Compute beta = (X^T W X)^(-1) X^T W Y
+    beta = torch.matmul(X_t_W_X_inv, X_t_W_Y)  # Shape [32, 1, 1] @ [32, 1, 1] = [32, 1, 1]
+
+    # Reshape beta to be [32] (removing extra dimensions)
+    beta = beta.view(-1)  # Shape [32]
+
+    return beta
+
+# Example usage
+X = torch.randn(32, 256, 1)
+Y = torch.randn(32, 256, 1)
+weights = torch.randn(32, 256).abs()  # Assuming weights are positive
+
+beta = weighted_linear_regression(X, Y, weights)
+print(beta.shape)  # Should output: torch.Size([32])
