@@ -1,0 +1,442 @@
+# Import necessary libraries
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import torch
+import torch.nn as nn
+import math
+from torch.nn.functional import softplus
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from itertools import product
+import unittest
+
+# Set random seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Data Preparation
+stock_symbol = 'AAPL'  # You can change this to any desired stock symbol
+sp500_symbol = '^GSPC'
+start_date = '2010-01-01'
+end_date = '2023-09-30'
+
+# Download stock and S&P 500 data
+stock_data = yf.download(stock_symbol, start=start_date, end=end_date)
+sp500_data = yf.download(sp500_symbol, start=start_date, end=end_date)
+
+# Calculate daily returns
+stock_data['Return'] = stock_data['Adj Close'].pct_change()
+sp500_data['Return'] = sp500_data['Adj Close'].pct_change()
+
+# Merge the data on dates
+data = pd.merge(
+    stock_data['Return'], sp500_data['Return'],
+    left_index=True, right_index=True, suffixes=('_Stock', '_SP500')
+)
+
+# Drop missing values
+data.dropna(inplace=True)
+data.reset_index(inplace=True)
+data['Date'] = pd.to_datetime(data['Date'])
+
+# Split the data into training, validation, and testing sets
+train_data = data[(data['Date'] >= '2010-01-01') & (data['Date'] <= '2017-12-31')].reset_index(drop=True)
+val_data = data[(data['Date'] >= '2018-01-01') & (data['Date'] <= '2019-12-31')].reset_index(drop=True)
+test_data = data[(data['Date'] >= '2020-01-01') & (data['Date'] <= '2023-09-30')].reset_index(drop=True)
+
+# Dataset Class
+class BetaDataset(Dataset):
+    def __init__(self, data, lookback):
+        self.lookback = lookback
+        self.stock_returns = data['Return_Stock'].values
+        self.sp500_returns = data['Return_SP500'].values
+
+    def __len__(self):
+        return len(self.stock_returns) - self.lookback - 1
+
+    def __getitem__(self, idx):
+        stock_seq = self.stock_returns[idx:idx + self.lookback]
+        sp500_seq = self.sp500_returns[idx:idx + self.lookback]
+        sp500_next = self.sp500_returns[idx + self.lookback]
+        stock_next = self.stock_returns[idx + self.lookback]
+        return {
+            'stock_seq': torch.tensor(stock_seq, dtype=torch.float32),
+            'sp500_seq': torch.tensor(sp500_seq, dtype=torch.float32),
+            'sp500_next': torch.tensor(sp500_next, dtype=torch.float32),
+            'stock_next': torch.tensor(stock_next, dtype=torch.float32),
+        }
+
+# Sinusoidal Positional Encoding
+def get_sinusoidal_positional_encoding(lookback, d_model):
+    position = torch.arange(0, lookback).unsqueeze(1).float()
+    div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+    pe = torch.zeros(lookback, d_model)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+# Transformer Model with trainable mu and sigma_inv
+class TransformerWeightGenerator(nn.Module):
+    def __init__(self, lookback, d_model=64, nhead=4, num_layers=2, dim_feedforward=256, dropout=0.1):
+        super(TransformerWeightGenerator, self).__init__()
+        self.lookback = lookback
+        self.d_model = d_model
+
+        # Input projection
+        self.input_proj = nn.Linear(1, d_model)
+
+        # Sinusoidal positional encoding
+        pe = get_sinusoidal_positional_encoding(lookback, d_model)
+        self.register_buffer('positional_encoding', pe)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers)
+
+        # Output layer to generate weights
+        self.output_layer = nn.Linear(d_model, 1)
+
+        # Global parameters mu and sigma_inv as trainable parameters
+        self.mu = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.sigma_param = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))  # Will apply softplus
+
+    def forward(self, x):
+        x = x.unsqueeze(-1)  # (batch_size, lookback, 1)
+        x = self.input_proj(x)
+        pe = self.positional_encoding.unsqueeze(0).to(x.device)
+        x = x + pe
+        x = self.transformer_encoder(x)
+        weights = self.output_layer(x).squeeze(-1)  # (batch_size, lookback)
+        weights = softplus(weights)  # Ensure positivity
+        return weights
+
+    def get_mu(self):
+        return self.mu
+
+    def get_sigma_inv(self):
+        sigma_inv = softplus(self.sigma_param)
+        return sigma_inv
+
+# Beta Estimation Function
+def estimate_beta(sp500_seq, stock_seq, weights, model):
+    X = sp500_seq  # (batch_size, lookback)
+    y = stock_seq  # (batch_size, lookback)
+    W = weights    # (batch_size, lookback)
+
+    # Get mu and sigma_inv from the model
+    mu = model.get_mu()  # Scalar tensor
+    sigma_inv = model.get_sigma_inv()  # Scalar tensor
+
+    # Reshape mu and sigma_inv to match batch size
+    batch_size = X.size(0)
+    mu = mu.expand(batch_size)  # (batch_size,)
+    sigma_inv = sigma_inv.expand(batch_size)  # (batch_size,)
+
+    # Compute components
+    XW = X * W  # (batch_size, lookback)
+    XWX = (XW * X).sum(dim=1)  # (batch_size,)
+    XWy = (XW * y).sum(dim=1)  # (batch_size,)
+
+    numerator = sigma_inv * mu + XWy
+    denominator = sigma_inv + XWX
+    beta = numerator / denominator
+
+    return beta  # (batch_size,)
+
+# RMSE Loss Function
+def RMSELoss(yhat, y):
+    mse = nn.MSELoss()(yhat, y)
+    rmse = torch.sqrt(mse + 1e-8)  # Add epsilon to prevent sqrt(0)
+    return rmse
+
+# Learning Rate Scheduler with Warm-Up and Decay
+class WarmupCosineAnnealingLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=0.0, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super(WarmupCosineAnnealingLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch + 1
+        if step <= self.warmup_steps:
+            return [base_lr * step / self.warmup_steps for base_lr in self.base_lrs]
+        else:
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * (step - self.warmup_steps) / (self.total_steps - self.warmup_steps + 1)))
+            return [self.min_lr + (base_lr - self.min_lr) * cosine_decay for base_lr in self.base_lrs]
+
+# Hyperparameters
+lookback = 128
+dropout = 0.25
+dim_feedforward = 128
+batch_size = 64
+learning_rate = 0.001
+num_epochs = 10
+nhead = 4
+num_layers = 2
+d_model = 64
+
+# Adjust the datasets
+val_data_adjusted = pd.concat([train_data.tail(lookback), val_data], ignore_index=True).reset_index(drop=True)
+test_data_adjusted = pd.concat([val_data.tail(lookback), test_data], ignore_index=True).reset_index(drop=True)
+
+train_dataset = BetaDataset(train_data, lookback)
+val_dataset = BetaDataset(val_data_adjusted, lookback)
+test_dataset = BetaDataset(test_data_adjusted, lookback)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# Initialize the model
+model = TransformerWeightGenerator(
+    lookback=lookback,
+    d_model=d_model,
+    nhead=nhead,
+    num_layers=num_layers,
+    dim_feedforward=dim_feedforward,
+    dropout=dropout
+)
+
+# Define optimizer
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# Define scheduler
+total_steps = num_epochs * len(train_loader)
+warmup_steps = int(0.1 * total_steps)  # Warm-up for 10% of total steps
+scheduler = WarmupCosineAnnealingLR(optimizer, warmup_steps, total_steps)
+
+# Training Loop
+mu_values = []
+sigma_inv_values = []
+for epoch in range(num_epochs):
+    model.train()
+    train_losses = []
+    for batch in train_loader:
+        optimizer.zero_grad()
+
+        sp500_seq = batch['sp500_seq']
+        stock_seq = batch['stock_seq']
+        sp500_next = batch['sp500_next']
+        stock_next = batch['stock_next']
+
+        weights = model(sp500_seq)
+        beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+        stock_pred = beta * sp500_next
+
+        loss = RMSELoss(stock_pred, stock_next)
+
+        loss.backward()
+
+        # Monitor gradients
+        mu_grad = model.mu.grad.item()
+        sigma_param_grad = model.sigma_param.grad.item()
+        # Uncomment the next line to print gradients
+        # print(f"mu_grad: {mu_grad}, sigma_param_grad: {sigma_param_grad}")
+
+        optimizer.step()
+        scheduler.step()
+
+        train_losses.append(loss.item())
+
+    avg_train_loss = np.mean(train_losses)
+
+    # Validation
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for batch in val_loader:
+            sp500_seq = batch['sp500_seq']
+            stock_seq = batch['stock_seq']
+            sp500_next = batch['sp500_next']
+            stock_next = batch['stock_next']
+
+            weights = model(sp500_seq)
+            beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+            stock_pred = beta * sp500_next
+
+            loss = RMSELoss(stock_pred, stock_next)
+            val_losses.append(loss.item())
+
+    avg_val_loss = np.mean(val_losses)
+
+    # Record parameter values
+    mu_value = model.get_mu().item()
+    sigma_inv_value = model.get_sigma_inv().item()
+    mu_values.append(mu_value)
+    sigma_inv_values.append(sigma_inv_value)
+
+    print(f"Epoch {epoch+1}/{num_epochs}, Training RMSE Loss: {avg_train_loss:.6f}, Validation RMSE Loss: {avg_val_loss:.6f}")
+    print(f"mu: {mu_value}, sigma_inv: {sigma_inv_value}")
+
+# Evaluate on Test Set
+model.eval()
+test_losses = []
+predictions = []
+actuals = []
+betas = []  # To store predicted betas
+weights_list = []  # To store weights for selected sequences
+with torch.no_grad():
+    for i, batch in enumerate(test_loader):
+        sp500_seq = batch['sp500_seq']
+        stock_seq = batch['stock_seq']
+        sp500_next = batch['sp500_next']
+        stock_next = batch['stock_next']
+
+        weights = model(sp500_seq)
+        beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+        stock_pred = beta * sp500_next
+
+        loss = RMSELoss(stock_pred, stock_next)
+        test_losses.append(loss.item())
+
+        predictions.extend(stock_pred.numpy())
+        actuals.extend(stock_next.numpy())
+        betas.extend(beta.numpy())
+
+        # Collect weights for first and last batches
+        if i == 0 or i == len(test_loader) - 1:
+            weights_list.append(weights.numpy())
+
+avg_test_loss = np.mean(test_losses)
+print(f"Test RMSE Loss: {avg_test_loss:.6f}")
+
+# Retrieve sigma and mu
+sigma_inv = model.get_sigma_inv().item()
+sigma = 1 / sigma_inv if sigma_inv != 0 else float('inf')  # Avoid division by zero
+mu = model.get_mu().item()
+print(f"\nLearned mu: {mu}")
+print(f"Learned sigma_inv: {sigma_inv}")
+print(f"Learned sigma: {sigma}")
+
+# Plotting Predicted vs. Actual Returns
+predictions = np.array(predictions)
+actuals = np.array(actuals)
+betas = np.array(betas)
+
+plt.figure(figsize=(12, 6))
+plt.plot(actuals, label='Actual Returns', alpha=0.7)
+plt.plot(predictions, label='Predicted Returns', alpha=0.7)
+plt.title('Predicted vs. Actual Stock Returns (Test Set)')
+plt.xlabel('Time')
+plt.ylabel('Return')
+plt.legend()
+plt.show()
+
+# Plotting Predicted Beta over the Test Set
+plt.figure(figsize=(12, 6))
+plt.plot(betas, label='Predicted Beta', color='purple')
+plt.title('Predicted Beta over the Test Set')
+plt.xlabel('Time')
+plt.ylabel('Beta')
+plt.legend()
+plt.show()
+
+# Plotting Weights for Two Sequences (Beginning and End of Test Set)
+for idx, weights in enumerate(weights_list):
+    plt.figure(figsize=(10, 4))
+    plt.bar(range(lookback), weights[0], color='skyblue')
+    if idx == 0:
+        plt.title('Weights for First Sequence in Test Set')
+    else:
+        plt.title('Weights for Last Sequence in Test Set')
+    plt.xlabel('Lookback Time Steps')
+    plt.ylabel('Weight')
+    plt.show()
+
+# Plot mu and sigma_inv values over epochs
+plt.figure()
+plt.plot(mu_values, label='mu')
+plt.plot(sigma_inv_values, label='sigma_inv')
+plt.title('mu and sigma_inv over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Value')
+plt.legend()
+plt.show()
+
+# Unit Tests to Ensure Data Integrity and Correct Model Functionality
+class TestTimeSeriesModel(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        # Use the already prepared data
+        cls.train_data = train_data
+        cls.val_data = val_data
+        cls.test_data = test_data
+
+    def test_no_data_leakage(self):
+        # Ensure that the lookback data appended to the validation and test sets comes from the correct previous sets
+        self.assertEqual(
+            list(val_data_adjusted['Date'].head(lookback)),
+            list(self.train_data['Date'].tail(lookback)),
+            "Validation set's lookback data does not match training data's last entries."
+        )
+        self.assertEqual(
+            list(test_data_adjusted['Date'].head(lookback)),
+            list(self.val_data['Date'].tail(lookback)),
+            "Test set's lookback data does not match validation data's last entries."
+        )
+
+    def test_dataset_functionality(self):
+        dataset = BetaDataset(self.train_data, lookback)
+        self.assertEqual(len(dataset), len(self.train_data) - lookback - 1, "Dataset length is incorrect.")
+
+        sample = dataset[0]
+        expected_keys = {'stock_seq', 'sp500_seq', 'sp500_next', 'stock_next'}
+        self.assertTrue(expected_keys.issubset(sample.keys()), "Dataset item keys are incorrect.")
+
+        # Check shapes
+        self.assertEqual(sample['stock_seq'].shape, (lookback,), "stock_seq shape is incorrect.")
+        self.assertEqual(sample['sp500_seq'].shape, (lookback,), "sp500_seq shape is incorrect.")
+        self.assertEqual(sample['sp500_next'].shape, (), "sp500_next shape is incorrect.")
+        self.assertEqual(sample['stock_next'].shape, (), "stock_next shape is incorrect.")
+
+    def test_mu_sigma_training(self):
+        # Test if mu and sigma_inv are being updated
+        model = TransformerWeightGenerator(lookback=lookback, d_model=d_model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+        dataset = BetaDataset(self.train_data, lookback)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+        model.train()
+
+        initial_mu = model.get_mu().item()
+        initial_sigma_inv = model.get_sigma_inv().item()
+
+        for batch in dataloader:
+            optimizer.zero_grad()
+            sp500_seq = batch['sp500_seq']
+            stock_seq = batch['stock_seq']
+            sp500_next = batch['sp500_next']
+            stock_next = batch['stock_next']
+
+            weights = model(sp500_seq)
+            beta = estimate_beta(sp500_seq, stock_seq, weights, model)
+            stock_pred = beta * sp500_next
+
+            loss = RMSELoss(stock_pred, stock_next)
+            loss.backward()
+            optimizer.step()
+            break  # Only need one update for testing
+
+        updated_mu = model.get_mu().item()
+        updated_sigma_inv = model.get_sigma_inv().item()
+
+        self.assertNotEqual(initial_mu, updated_mu, "mu did not update during training.")
+        self.assertNotEqual(initial_sigma_inv, updated_sigma_inv, "sigma_inv did not update during training.")
+
+    def test_weights_variability(self):
+        # Test that the weights vary with different input sequences
+        model.eval()
+        sp500_seq1 = torch.randn(1, lookback)
+        sp500_seq2 = torch.randn(1, lookback)
+        weights1 = model(sp500_seq1)
+        weights2 = model(sp500_seq2)
+        self.assertFalse(torch.allclose(weights1, weights2), "Weights do not vary with input sequences.")
+
+if __name__ == '__main__':
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
