@@ -1,0 +1,59 @@
+import torch
+
+# Function for weighted linear regression using matrix multiplication and torch.linalg.solve
+def weighted_linear_regression(X, Y, weights):
+    # Reshape weights to create a diagonal matrix for each batch
+    W = torch.diag_embed(weights)  # Shape [32, 256, 256]
+
+    # Reshape X and Y for matrix multiplication (X should have a last dimension of 1 for correct broadcasting)
+    X = X.unsqueeze(2)  # Shape [32, 256, 1]
+    Y = Y.unsqueeze(2)  # Shape [32, 256, 1]
+
+    # Compute X^T W X for each batch
+    X_t = X.transpose(1, 2)  # Shape [32, 1, 256]
+    X_t_W = torch.matmul(X_t, W)  # Shape [32, 1, 256] @ [32, 256, 256] = [32, 1, 256]
+    X_t_W_X = torch.matmul(X_t_W, X)  # Shape [32, 1, 256] @ [32, 256, 1] = [32, 1, 1]
+
+    # Compute X^T W Y for each batch
+    X_t_W_Y = torch.matmul(X_t_W, Y)  # Shape [32, 1, 256] @ [32, 256, 1] = [32, 1, 1]
+
+    # Solve the system (X^T W X) * beta = X^T W Y for beta using torch.linalg.solve
+    beta = torch.linalg.solve(X_t_W_X, X_t_W_Y)  # Shape [32, 1, 1]
+
+    # Reshape beta to be [32] (removing extra dimensions)
+    beta = beta.view(-1)  # Shape [32]
+
+    return beta
+
+# Example usage
+X = torch.randn(32, 256)
+Y = torch.randn(32, 256)
+weights = torch.randn(32, 256).abs()  # Assuming weights are positive
+
+beta = weighted_linear_regression(X, Y, weights)
+print(beta.shape)  #
+
+import torch
+
+# Function for weighted linear regression
+def weighted_linear_regression(X, Y, weights):
+    # Weights are already shaped correctly and can be used in element-wise operations
+    W = weights  # Shape [32, 256]
+
+    # Compute element-wise products: (X^T W X) and (X^T W Y)
+    X_t_W_X = torch.sum(W * X * X, dim=1)  # Shape [32]
+    X_t_W_Y = torch.sum(W * X * Y, dim=1)  # Shape [32]
+
+    # Compute beta for each batch: beta = (X^T W X)^(-1) X^T W Y
+    beta = X_t_W_Y / X_t_W_X  # Shape [32] (element-wise division)
+
+    return beta
+
+# Example usage
+X = torch.randn(32, 256)
+Y = torch.randn(32, 256)
+weights = torch.randn(32, 256).abs()  # Assuming weights are positive
+
+beta = weighted_linear_regression(X, Y, weights)
+print(beta.shape)  # Should output: torch.Size([32])
+
